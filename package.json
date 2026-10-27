@@ -2,8 +2,8 @@
   "name": "vscode-zai-usage",
   "displayName": "VSCode z.ai Usage",
   "description": "Display z.ai token usage in the status bar",
-  "version": "0.5.0",
-  "publisher": "j4rviscmd",
+  "version": "0.7.1",
+  "publisher": "vanelizarov",
   "license": "MIT",
   "icon": "icon.png",
   "repository": {

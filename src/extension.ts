@@ -252,6 +252,17 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   /**
+   * Clears any highlight applied to the status bar item, restoring its default
+   * appearance.
+   *
+   * @returns `void`
+   */
+  function clearStatusBarColor(): void {
+    statusBarItem.backgroundColor = undefined;
+    statusBarItem.color = undefined;
+  }
+
+  /**
    * Configures the status bar item to reflect the "no API key" state.
    *
    * Sets the item's label to "Set API Key" and attaches the `zaiUsage.setApiKey`
@@ -260,6 +271,7 @@ export function activate(context: vscode.ExtensionContext): void {
    * @returns `void`
    */
   function applyNoApiKeyState(): void {
+    clearStatusBarColor();
     statusBarItem.command = "zaiUsage.setApiKey";
     statusBarItem.text = getLabel("Set API Key");
     statusBarItem.tooltip = "Click to set your z.ai API key";
@@ -271,9 +283,11 @@ export function activate(context: vscode.ExtensionContext): void {
    * Possible outcomes:
    * - **No API key**: delegates to {@link applyNoApiKeyState} to prompt the user.
    * - **Fetch failure**: displays a dash and an error tooltip.
-   * - **Success**: renders the usage percentage of the most-consumed quota window
-   *   with its reset countdown; the tooltip shows the plan level reported by the
-   *   API along with every quota window, and the configured refresh interval.
+   * - **Success**: renders every quota window with its compact label, percentage
+   *   and reset countdown (e.g. `5h 5% (2h30m) · mo 21% (6d 3h)`); the tooltip
+   *   shows the plan level reported by the API along with full details.
+   * - **Exhausted**: when any window is fully consumed, the item is highlighted
+   *   with the warning color and shows that window's remaining time until reset.
    *
    * After a successful live API call ({@link fetchUsage} returns `apiCalled: true`),
    * the polling interval is restarted via {@link startInterval} so that the next
@@ -288,6 +302,7 @@ export function activate(context: vscode.ExtensionContext): void {
       applyNoApiKeyState();
     } else if (usage === null) {
       statusBarItem.command = "zaiUsage.updateStatusBar";
+      clearStatusBarColor();
       statusBarItem.text = getLabel("-");
       statusBarItem.tooltip =
         "Unable to fetch z.ai usage data (click to refresh)";
@@ -299,24 +314,42 @@ export function activate(context: vscode.ExtensionContext): void {
       const displayMode = vscode.workspace
         .getConfiguration("zaiUsage")
         .get<string>("displayMode", "usage");
-
-      // Calculate display percentage based on display mode
       const isRemaining = displayMode === "remaining";
-      const displayPercentage = isRemaining
-        ? Math.round((100 - usage.percentage) * 10) / 10
-        : usage.percentage;
 
-      const resetStr = formatResetTime(usage.nextResetTime);
-      const suffix = resetStr
-        ? `${displayPercentage}% ${resetStr}`
-        : `${displayPercentage}%`;
-      statusBarItem.text = getLabel(suffix);
+      // Render every quota window, e.g. "5h 5% (2h30m) · mo 21% (6d 3h)".
+      // Each window gets its compact label, percentage (per the display mode,
+      // clamped to 0-100) and its own reset countdown. When the API reports a
+      // single window the label is omitted.
+      const parts = usage.limits.map((limit) => {
+        const pct = Math.min(Math.round(limit.percentage * 10) / 10, 100);
+        const displayPct = isRemaining
+          ? Math.round((100 - pct) * 10) / 10
+          : pct;
+        const reset = formatResetTime(limit.nextResetTime);
+        const value = `${displayPct}%${reset ? ` ${reset}` : ""}`;
+        return usage.limits.length > 1 ? `${limit.shortLabel} ${value}` : value;
+      });
+      statusBarItem.text = getLabel(parts.join(" · "));
+
+      // When any quota window is exhausted, highlight the item with the
+      // standard warning color (light yellow); the exhausted window's reset
+      // countdown is shown inline next to its percentage.
+      if (usage.exhausted) {
+        statusBarItem.backgroundColor = new vscode.ThemeColor(
+          "statusBarItem.warningBackground",
+        );
+        statusBarItem.color = new vscode.ThemeColor(
+          "statusBarItem.warningForeground",
+        );
+      } else {
+        clearStatusBarColor();
+      }
 
       // Build the tooltip: the plan level reported by the API plus every
       // quota window with its percentage, credits and reset countdown.
       const tooltip = new vscode.MarkdownString();
       tooltip.appendMarkdown(
-        `**z.ai usage**${usage.plan ? ` — plan: **${usage.plan}**` : ""}`,
+        `**z.ai usage**${usage.plan ? ` — plan: **${usage.plan}**` : ""}${usage.exhausted ? " — **limit exhausted**" : ""}`,
       );
       for (const limit of usage.limits) {
         const credits =

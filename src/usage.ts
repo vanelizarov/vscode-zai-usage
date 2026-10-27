@@ -56,6 +56,8 @@ export interface ZaiApiResponse {
 export interface LimitUsage {
   /** Human-readable label for the window (e.g. `"5-hour credits"`). */
   label: string;
+  /** Compact label for the status bar (e.g. `"5h"`, `"mo"`). */
+  shortLabel: string;
   /** Usage percentage 0-100, rounded to one decimal place. */
   percentage: number;
   /** Credits consumed within the window, or `null` when not reported. */
@@ -64,6 +66,8 @@ export interface LimitUsage {
   total: number | null;
   /** Unix timestamp (ms) of the next reset, or `null` when not reported. */
   nextResetTime: number | null;
+  /** Whether the window has been fully consumed. */
+  exhausted: boolean;
 }
 
 /**
@@ -76,6 +80,8 @@ export interface UsageData {
   nextResetTime: number | null;
   /** Subscription plan level from the API (e.g. `"pro"`), or `null` if absent. */
   plan: string | null;
+  /** Whether the most-consumed limit (the binding constraint) is exhausted. */
+  exhausted: boolean;
   /** All parsed limit windows, used to build the status bar tooltip. */
   limits: LimitUsage[];
 }
@@ -106,6 +112,33 @@ function limitPercentage(limit: ZaiLimit): number | null {
 }
 
 /**
+ * Determines whether a limit window has been fully consumed.
+ *
+ * A window is considered exhausted when any of the following hold:
+ * - The API reports `remaining: 0`.
+ * - Consumed credits are at or above the granted total (the API can report a
+ *   small overage, e.g. `currentValue` 12009 over a 12000-credit window).
+ * - The computed percentage is 100 or higher.
+ *
+ * @param limit - The raw {@link ZaiLimit} entry from the API.
+ * @param pct - The normalized usage percentage (0-100) for the same entry.
+ * @returns `true` when the window is exhausted; `false` otherwise.
+ */
+function isLimitExhausted(limit: ZaiLimit, pct: number): boolean {
+  if (limit.remaining === 0) {
+    return true;
+  }
+  if (
+    typeof limit.usage === "number" &&
+    typeof limit.currentValue === "number" &&
+    limit.currentValue >= limit.usage
+  ) {
+    return true;
+  }
+  return pct >= 100;
+}
+
+/**
  * Builds a human-readable label for a limit entry based on its window unit.
  *
  * Known units are labeled semantically; unknown units fall back to the raw
@@ -125,6 +158,23 @@ function limitLabel(limit: ZaiLimit): string {
   return limit.unit !== undefined
     ? `${limit.type} (unit ${limit.unit})`
     : limit.type;
+}
+
+/**
+ * Builds a compact label for a limit entry, suitable for the constrained
+ * width of the status bar.
+ *
+ * @param limit - The raw {@link ZaiLimit} entry from the API.
+ * @returns A short label such as `"5h"` or `"mo"`.
+ */
+function limitShortLabel(limit: ZaiLimit): string {
+  if (limit.unit === 3) {
+    return `${limit.number ?? "?"}h`;
+  }
+  if (limit.unit === 6) {
+    return "mo";
+  }
+  return limit.unit !== undefined ? `u${limit.unit}` : limit.type;
 }
 
 /**
@@ -151,11 +201,13 @@ export function extractUsageData(data: ZaiApiResponse): UsageData | null {
     }
     limits.push({
       label: limitLabel(raw),
+      shortLabel: limitShortLabel(raw),
       percentage: Math.round(pct * 10) / 10,
       used: typeof raw.currentValue === "number" ? raw.currentValue : null,
       total: typeof raw.usage === "number" ? raw.usage : null,
       nextResetTime:
         typeof raw.nextResetTime === "number" ? raw.nextResetTime : null,
+      exhausted: isLimitExhausted(raw, pct),
     });
   }
 
@@ -173,20 +225,24 @@ export function extractUsageData(data: ZaiApiResponse): UsageData | null {
     percentage: binding.percentage,
     nextResetTime: binding.nextResetTime,
     plan: data.data?.level ?? null,
+    exhausted: binding.exhausted,
     limits,
   };
 }
 
 /**
  * Formats the time remaining until a quota reset into a short human-readable
- * string such as `"(2h30m)"` or `"(45m)"`.
+ * string such as `"(6d 3h 20m)"`, `"(2h 30m)"` or `"(45m)"`.
+ *
+ * Only non-zero components are included, so no `0d`, `0h` or `0m` segments
+ * are ever rendered.
  *
  * Returns an empty string when `nextResetTime` is falsy, non-positive, or
  * already in the past.
  *
  * @param nextResetTime - The Unix timestamp (in milliseconds) of the next reset,
  *   or `null` if unknown.
- * @returns A formatted countdown string like `"(1h5m)"`, or `""` if not applicable.
+ * @returns A formatted countdown string like `"(1h 5m)"`, or `""` if not applicable.
  */
 export function formatResetTime(nextResetTime: number | null): string {
   if (!nextResetTime || nextResetTime <= 0) {
@@ -197,10 +253,13 @@ export function formatResetTime(nextResetTime: number | null): string {
     return "";
   }
   const diffSec = Math.floor(diffMs / 1000);
-  const diffHours = Math.floor(diffSec / 3600);
+  const diffDays = Math.floor(diffSec / 86400);
+  const diffHours = Math.floor((diffSec % 86400) / 3600);
   const diffMins = Math.floor((diffSec % 3600) / 60);
   const parts: string[] = [];
+  if (diffDays > 0) parts.push(`${diffDays}d`);
   if (diffHours > 0) parts.push(`${diffHours}h`);
-  parts.push(`${diffMins}m`);
-  return `(${parts.join("")})`;
+  if (diffMins > 0) parts.push(`${diffMins}m`);
+  // Less than a full minute left: report it as such instead of an empty string.
+  return parts.length > 0 ? `(${parts.join(" ")})` : "(<1m)";
 }
