@@ -1,33 +1,10 @@
 import * as vscode from "vscode";
-
-/**
- * Represents a single usage limit entry returned by the z.ai quota API.
- */
-interface ZaiLimit {
-  /** The type identifier of the limit (e.g. `"TOKENS_LIMIT"`). */
-  type: string;
-  /** The current usage as a decimal percentage (e.g. `0.753` means 75.3 %). */
-  percentage: number;
-  /** Unix timestamp (ms) at which this limit will reset. */
-  nextResetTime: number;
-}
-
-/**
- * The top-level response shape returned by the z.ai quota/limit API endpoint.
- */
-interface ZaiApiResponse {
-  /** Whether the API call succeeded. `false` indicates an application-level error. */
-  success?: boolean;
-  /** Application-level error code, present when `success` is `false`. */
-  code?: number;
-  /** Human-readable error message, present when `success` is `false`. */
-  msg?: string;
-  /** The payload containing the list of quota limits. */
-  data: {
-    /** Array of per-type quota limit entries. */
-    limits: ZaiLimit[];
-  };
-}
+import {
+  extractUsageData,
+  formatResetTime,
+  type UsageData,
+  type ZaiApiResponse,
+} from "./usage";
 
 /**
  * The structure persisted to `globalState` for caching API responses.
@@ -41,18 +18,8 @@ interface CacheData {
   data: ZaiApiResponse;
 }
 
-/**
- * Simplified token-usage statistics derived from a {@link ZaiApiResponse}.
- */
-interface UsageData {
-  /** Rounded token usage percentage (one decimal place, e.g. `75.3`). */
-  percentage: number;
-  /** Unix timestamp (ms) of the next quota reset, or `null` if unknown. */
-  nextResetTime: number | null;
-}
-
 /** Schema version embedded in every cache entry; increment to bust old caches. */
-const CACHE_VERSION = "1.0";
+const CACHE_VERSION = "1.1";
 /** Key used to store the cache object in `vscode.ExtensionContext.globalState`. */
 const CACHE_KEY = "zaiUsage.cache";
 /** Key used to store the API key in `vscode.ExtensionContext.secrets`. */
@@ -139,32 +106,6 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   /**
-   * Extracts token-usage statistics from a raw API response.
-   * Looks for the `TOKENS_LIMIT` entry inside `data.limits` and maps it to a
-   * simplified {@link UsageData} object.
-   *
-   * @param data - The raw {@link ZaiApiResponse} returned by the z.ai quota API.
-   * @returns A {@link UsageData} object containing the usage percentage and next reset
-   *   timestamp, or `null` when the expected data structure is absent.
-   */
-  function extractUsageData(data: ZaiApiResponse): UsageData | null {
-    const limits = data.data?.limits;
-    if (!Array.isArray(limits)) {
-      return null;
-    }
-
-    const tokenLimit = limits.find((l) => l.type === "TOKENS_LIMIT");
-    if (!tokenLimit) {
-      return null;
-    }
-
-    return {
-      percentage: Math.round(tokenLimit.percentage * 10) / 10,
-      nextResetTime: tokenLimit.nextResetTime ?? null,
-    };
-  }
-
-  /**
    * Determines whether a cached API response is still valid and can be used
    * without issuing a new network request.
    *
@@ -190,34 +131,6 @@ export function activate(context: vscode.ExtensionContext): void {
       return false;
     }
     return true;
-  }
-
-  /**
-   * Formats the time remaining until the next usage quota reset into a short
-   * human-readable string such as `"(2h30m)"` or `"(45m)"`.
-   *
-   * Returns an empty string when `nextResetTime` is falsy, non-positive, or
-   * already in the past.
-   *
-   * @param nextResetTime - The Unix timestamp (in milliseconds) of the next reset,
-   *   or `null` if unknown.
-   * @returns A formatted countdown string like `"(1h5m)"`, or `""` if not applicable.
-   */
-  function formatResetTime(nextResetTime: number | null): string {
-    if (!nextResetTime || nextResetTime <= 0) {
-      return "";
-    }
-    const diffMs = nextResetTime - Date.now();
-    if (diffMs <= 0) {
-      return "";
-    }
-    const diffSec = Math.floor(diffMs / 1000);
-    const diffHours = Math.floor(diffSec / 3600);
-    const diffMins = Math.floor((diffSec % 3600) / 60);
-    const parts: string[] = [];
-    if (diffHours > 0) parts.push(`${diffHours}h`);
-    parts.push(`${diffMins}m`);
-    return `(${parts.join("")})`;
   }
 
   /**
@@ -358,8 +271,9 @@ export function activate(context: vscode.ExtensionContext): void {
    * Possible outcomes:
    * - **No API key**: delegates to {@link applyNoApiKeyState} to prompt the user.
    * - **Fetch failure**: displays a dash and an error tooltip.
-   * - **Success**: renders the usage percentage and optional reset countdown; also
-   *   shows a tooltip with full details and the configured refresh interval.
+   * - **Success**: renders the usage percentage of the most-consumed quota window
+   *   with its reset countdown; the tooltip shows the plan level reported by the
+   *   API along with every quota window, and the configured refresh interval.
    *
    * After a successful live API call ({@link fetchUsage} returns `apiCalled: true`),
    * the polling interval is restarted via {@link startInterval} so that the next
@@ -380,7 +294,6 @@ export function activate(context: vscode.ExtensionContext): void {
     } else {
       statusBarItem.command = "zaiUsage.updateStatusBar";
       const refreshSec = getRefreshInterval() / 1000;
-      const resetStr = formatResetTime(usage.nextResetTime);
 
       // Get display mode setting (default: "usage")
       const displayMode = vscode.workspace
@@ -393,18 +306,35 @@ export function activate(context: vscode.ExtensionContext): void {
         ? Math.round((100 - usage.percentage) * 10) / 10
         : usage.percentage;
 
+      const resetStr = formatResetTime(usage.nextResetTime);
       const suffix = resetStr
         ? `${displayPercentage}% ${resetStr}`
         : `${displayPercentage}%`;
       statusBarItem.text = getLabel(suffix);
 
-      // Build tooltip text
-      const resetTooltip = resetStr
-        ? ` — resets in ${resetStr.replace(/[()]/g, "")}`
-        : "";
-      statusBarItem.tooltip =
-        `z.ai token ${displayMode}: ${displayPercentage}%${resetTooltip} ` +
-        `\n(auto-refreshes every ${refreshSec}s. click to refresh immediately)`;
+      // Build the tooltip: the plan level reported by the API plus every
+      // quota window with its percentage, credits and reset countdown.
+      const tooltip = new vscode.MarkdownString();
+      tooltip.appendMarkdown(
+        `**z.ai usage**${usage.plan ? ` — plan: **${usage.plan}**` : ""}`,
+      );
+      for (const limit of usage.limits) {
+        const credits =
+          limit.used !== null && limit.total !== null
+            ? ` (${limit.used.toLocaleString("en-US")}/${limit.total.toLocaleString("en-US")} credits)`
+            : "";
+        const reset = formatResetTime(limit.nextResetTime);
+        const resetSuffix = reset
+          ? ` — resets in ${reset.replace(/[()]/g, "")}`
+          : "";
+        tooltip.appendMarkdown(
+          `\n\n- ${limit.label}: **${limit.percentage}%**${credits}${resetSuffix}`,
+        );
+      }
+      tooltip.appendMarkdown(
+        `\n\n(auto-refreshes every ${refreshSec}s. click to refresh immediately)`,
+      );
+      statusBarItem.tooltip = tooltip;
     }
 
     if (apiCalled) {
